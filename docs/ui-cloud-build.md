@@ -26,26 +26,27 @@
 其中 `comparison.json` 记录状态，`baseline.log` / `candidate.log` 记录 Cargo 输出；失败命令的最后 100 行也直接显示在任务日志中。
 `state: incomplete` 表示比较尚未完成，不能当作测试通过。
 
-v2.3.7 原版有三份未入库的编译期测试输入，比较脚本会自动调用 `tools/restore_translator_fixtures.py` 恢复：
+v2.3.7 原版遗漏了三份编译期测试输入。发布包及按测试正文匹配的历史恢复未成功，
+因此本 fork 补写了以下三份合成 LLVM IR，直接入库，不再从网络下载：
 
 - `translator/translator/validation/fixtures/public/kernel_nullable_branch_cursor.ll`
 - `translator/translator/validation/fixtures/public/kernel_nested_loop_constant_weight_walk.ll`
 - `translator/translator/validation/fixtures/public/vertex_narrow_attributes.ll`
 
-恢复脚本下载固定版本 `metal2vulkan 0.1.0` 的 crates.io 发布包，用官方索引中的 SHA256 校验，
-从 `.cargo_vcs_info.json` 取得发布时的 Git 提交，再从 `steelbrain/metal2vulkan` 的该提交读取真实文件。
-发布包本身排除了 `validation/`，因此需要回到其 Git 来源恢复。
-若发布时提交尚未包含这些输入，则搜索驱动首次导入翻译器之前的上游历史，要求三项测试函数正文
-与驱动所带版本一致，并且三份输入都存在，才接受该历史快照。不会直接使用当前上游的输入，也不生成替代数据。
+这些是本 fork 新写的替代输入，不是找回的上游原件。覆盖可为空的分支游标、双层循环中的常量权重游标、
+以及 uchar/ushort 顶点属性。Rust 测试正文和原有结构断言保持不变。比较使用原版源码加相同补充输入，
+因此不声称复现了上游缺失输入的原始覆盖范围。三项对应测试在基线和当前分支都必须通过，
+不能把替代输入造成的失败当作可接受的历史失败。
 
-三份文件补入两边临时源码，工作区不变；已存在的同名文件若内容不同，会停止比较。
-附件中的 `restored-fixtures/` 保存文件和来源记录 `source.json`（提交、发布包校验值和每份文件 SHA256），
-`fixtures.log` 保存下载与 Git 日志。网络、校验或文件恢复失败会保留 `incomplete`，不会跳过测试。
+`tools/restore_translator_fixtures.py` 将这三份入库文件补入基线临时源码；两边同名输入若不同，会停止比较。
+附件中的 `restored-fixtures/` 保存文件和记录 `source.json`（明确标记非上游原件及每份 SHA256）。
+`userland` 还会调用编译出的翻译器 C 接口，核对原测试要求的缓冲区访问、Phi、窄整数能力和 32 位输入接口，
+结果及 SPIR-V 输出保存于 `ui-build-logs-<commit>/fixture-checks/`。这只验证翻译结果结构，不做 GPU 像素验证。
 
-也可以单独下载到本地工作区，用于后续提交保存这些输入：
+无需 Rust 编译即可对已有的 x86_64 翻译器库执行同样检查：
 
 ```sh
-python3 tools/restore_translator_fixtures.py --output translator/translator/validation/fixtures/public
+python3 tools/check_translator_fixtures.py --library /path/to/libnvmtl_translate.dylib --output .local/fixture-checks
 ```
 
 在运行页面下载 `ui-userland-x86_64-<commit>` 获取候选文件，另有构建日志与测试结果附件，保留 14 天。

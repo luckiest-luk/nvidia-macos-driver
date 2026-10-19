@@ -49,6 +49,9 @@ for name in NVMTLDriver libnvmtl_translate.dylib; do
     test "$minos" = 15.0 || { echo "Unexpected minimum OS for $name: $minos"; exit 1; }
     otool -L "$binary" > "$REPORTS/$name-libraries.txt"
 done
+echo 'Checking authored regression inputs against the compiled translator.'
+python3 "$ROOT/tools/check_translator_fixtures.py" \
+    --library "$ARTIFACTS/libnvmtl_translate.dylib" --output "$REPORTS/fixture-checks"
 python3 - "$ROOT" "$ARTIFACTS" <<'PY'
 import hashlib, json, os, subprocess, sys
 from pathlib import Path

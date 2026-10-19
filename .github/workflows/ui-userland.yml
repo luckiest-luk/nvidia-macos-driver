@@ -10,6 +10,7 @@ on:
       - 'tools/compare_translator_ci.py'
       - 'tools/restore_translator_fixtures.py'
       - 'tools/test_translator_ci.py'
+      - 'tools/check_translator_fixtures.py'
       - '.github/workflows/ui-userland.yml'
   workflow_dispatch:
 
@@ -111,7 +112,7 @@ jobs:
           key: ui-tests-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('translator/translator/Cargo.lock', 'translator/translator/Cargo.toml', 'tools/compare_translator_ci.py') }}-${{ github.sha }}
           restore-keys: |
             ui-tests-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('translator/translator/Cargo.lock', 'translator/translator/Cargo.toml', 'tools/compare_translator_ci.py') }}-
-      - name: Restore upstream fixtures and compare tests with v2.3.7
+      - name: Prepare authored fixtures and compare tests with v2.3.7
         run: python3 tools/compare_translator_ci.py
       - name: Upload test comparison and logs
         if: always()

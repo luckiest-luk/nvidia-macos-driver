@@ -10,6 +10,8 @@ import subprocess
 import sys
 import tempfile
 
+from restore_translator_fixtures import TEST_NAMES
+
 BASE = 'e2b0e547a18841b7d944850b03c9e605df76720b'
 ROOT = Path(__file__).resolve().parents[1]
 OUT = Path(os.environ.get('UI_CI_OUT', str(ROOT / '.local/cloud-ci/output'))) / 'tests'
@@ -34,6 +36,11 @@ def compare(before, after):
             'missing_tests': sorted(set(before) - set(after)),
             'newly_ignored': sorted(name for name, value in after.items()
                                     if value == 'ignored' and before.get(name) in ('ok', 'FAILED'))}
+
+
+def fixture_test_failures(results):
+    states = {name.rsplit('::', 1)[-1]: value for name, value in results.items()}
+    return [name for name in TEST_NAMES if states.get(name) != 'ok']
 
 
 def run_logged(args, label):
@@ -82,7 +89,7 @@ def restore_fixtures(baseline, candidate):
     _, code = run_logged([sys.executable, str(ROOT / 'tools/restore_translator_fixtures.py'),
                           '--output', str(output)], 'fixtures')
     if code:
-        raise RuntimeError(f'Upstream fixture recovery failed (exit code {code}); see fixtures.log.')
+        raise RuntimeError(f'Fixture preparation failed (exit code {code}); see fixtures.log.')
     provenance = json.loads((output / 'source.json').read_text())
     for item in provenance['files']:
         relative = Path('translator/translator/validation/fixtures/public') / item['name']
@@ -90,7 +97,7 @@ def restore_fixtures(baseline, candidate):
         for source in (baseline, candidate):
             target = source / relative
             if target.exists() and target.read_bytes() != data:
-                raise RuntimeError(f'Test fixture differs from the pinned upstream input: {relative}')
+                raise RuntimeError(f'Test fixture differs from the recorded regression input: {relative}')
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
     return provenance
@@ -141,8 +148,11 @@ def main():
             before = run_tests(baseline, 'baseline')
             after = run_tests(candidate, 'candidate')
         report.update({'baseline': before, 'candidate': after, **compare(before, after)})
+        report['fixture_test_failures'] = {label: fixture_test_failures(results) for label, results in
+                                          [('baseline', before), ('candidate', after)]}
         report['state'] = 'passed' if not any(report[key] for key in
-            ('new_failures', 'missing_tests', 'newly_ignored')) else 'failed'
+            ('new_failures', 'missing_tests', 'newly_ignored')) and not any(
+                report['fixture_test_failures'].values()) else 'failed'
     except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
         report['error'] = str(exc)
     (OUT / 'comparison.json').write_text(json.dumps(report, indent=2) + '\n')
