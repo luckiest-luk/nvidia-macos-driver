@@ -10,7 +10,7 @@
 
 use crate::spirv_module::{Block, Instruction, Module, Operand};
 use spirv::{BuiltIn, Capability, Decoration, Op, StorageClass, Word};
-use std::collections::HashMap;
+use crate::fxhash::HashMap;
 
 pub(crate) const STENCIL_EXPORT_PUSH_OFFSET: u32 = 160;
 

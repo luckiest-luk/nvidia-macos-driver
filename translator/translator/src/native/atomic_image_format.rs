@@ -14,7 +14,7 @@
 
 use crate::spirv_module::{Instruction, Module, Operand};
 use spirv::{ImageFormat, Op, StorageClass, Word};
-use std::collections::{HashMap, HashSet};
+use crate::fxhash::{HashMap, HashSet};
 
 fn atomic_capable(format: ImageFormat) -> bool {
     matches!(
@@ -50,7 +50,7 @@ pub(super) fn construct_atomic_storage_image_formats(module: &mut Module) -> boo
         .filter_map(|i| i.result_id.map(|id| (id, i.clone())))
         .collect();
     // every function-level instruction by result id, to walk an image pointer back to its variable
-    let mut producers: HashMap<Word, Instruction> = HashMap::new();
+    let mut producers: HashMap<Word, Instruction> = HashMap::default();
     for function in &module.functions {
         for block in &function.blocks {
             for inst in &block.instructions {
@@ -151,7 +151,7 @@ pub(super) fn construct_atomic_storage_image_formats(module: &mut Module) -> boo
         let Some(img) = defs.get(&image) else { continue };
         let mut new_types: Vec<Instruction> = Vec::new();
         // remap old type id -> new type id, innermost first
-        let mut remap: HashMap<Word, Word> = HashMap::new();
+        let mut remap: HashMap<Word, Word> = HashMap::default();
         let new_image = module.fresh_id();
         let mut ops = img.operands.clone();
         ops[6] = Operand::ImageFormat(want);
@@ -168,7 +168,7 @@ pub(super) fn construct_atomic_storage_image_formats(module: &mut Module) -> boo
             remap.insert(outer, id);
         }
         // a pointer of the variable's storage class to every remapped type (access chains may stop at any level)
-        let mut ptr_to: HashMap<Word, Word> = HashMap::new();
+        let mut ptr_to: HashMap<Word, Word> = HashMap::default();
         for (&old, &new) in &remap {
             let id = module.fresh_id();
             new_types.push(Instruction::new(
@@ -180,7 +180,7 @@ pub(super) fn construct_atomic_storage_image_formats(module: &mut Module) -> boo
             ptr_to.insert(old, id);
         }
         // every id derived from the variable: pointers keep their level, loads become the new value type
-        let mut derived: HashSet<Word> = HashSet::from([var]);
+        let mut derived: HashSet<Word> = crate::fxhash::set_from([var]);
         loop {
             let before = derived.len();
             for p in producers.values() {

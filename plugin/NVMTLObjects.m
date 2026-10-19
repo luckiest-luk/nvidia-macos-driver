@@ -1334,7 +1334,17 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
     }
     if (c) { if (p) [h nvmtlGiveRange:o length:c]; [h nvmtlReleaseSubAllocation:c]; }
 }
-- (MTLTextureUsage)usage { if (_usage) return (MTLTextureUsage)_usage; if (_parent) return [_parent usage]; return MTLTextureUsageShaderRead; }
+- (MTLTextureUsage)usage {
+    if (_usage) return (MTLTextureUsage)_usage;
+    NVMTLTexture *root = self;
+    while (root->_parent) root = root->_parent;
+    // Only expose capabilities backed by this IOSurface's storage image.
+    // Keep explicit usage masks and framebuffer-only restrictions unchanged.
+    if (root->_surf && !root->_fbo && _stex)
+        return MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
+    if (_parent) return [_parent usage];
+    return MTLTextureUsageShaderRead;
+}
 - (id<MTLBuffer>)buffer { return _backBuf ? _backBuf : _parent ? [_parent buffer] : nil; }
 - (NSUInteger)bufferOffset { return _backBuf ? _backOff : _parent ? [_parent bufferOffset] : 0; }
 - (NSUInteger)bufferBytesPerRow { return _backBuf ? _backBPR : _parent ? [_parent bufferBytesPerRow] : 0; }

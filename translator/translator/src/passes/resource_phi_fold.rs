@@ -15,7 +15,7 @@
 // alone.
 use crate::spirv_module::{Instruction, Operand};
 use spirv::{Op, StorageClass, Word};
-use std::collections::{HashMap, HashSet};
+use crate::fxhash::{HashMap, HashSet};
 
 use super::Ctx;
 
@@ -62,14 +62,14 @@ pub(super) fn fold_constant_resource_phis(ctx: &mut Ctx, entry_idx: usize) -> us
         .iter()
         .filter_map(|b| Some((label(b)?, b.instructions.last()?)))
         .collect();
-    let mut preds: HashMap<Word, Vec<Word>> = HashMap::new();
+    let mut preds: HashMap<Word, Vec<Word>> = HashMap::default();
     for (&block, term) in &terminators {
         for target in branch_targets(term) {
             preds.entry(target).or_default().push(block);
         }
     }
 
-    let mut replace: HashMap<Word, Word> = HashMap::new();
+    let mut replace: HashMap<Word, Word> = HashMap::default();
     for (block_index, block) in function.blocks.iter().enumerate() {
         let Some(merge) = label(block) else { continue };
         for (phi_index, phi) in block
@@ -254,9 +254,9 @@ impl<'a> Eval<'a> {
         defs: &'a HashMap<Word, &'a Instruction>,
         flow: &Flow,
     ) -> Self {
-        let mut stores: HashMap<Word, Vec<(Word, (usize, usize))>> = HashMap::new();
-        let mut loads: HashMap<Word, Vec<(usize, usize)>> = HashMap::new();
-        let mut escaped: HashSet<Word> = HashSet::new();
+        let mut stores: HashMap<Word, Vec<(Word, (usize, usize))>> = HashMap::default();
+        let mut loads: HashMap<Word, Vec<(usize, usize)>> = HashMap::default();
+        let mut escaped: HashSet<Word> = HashSet::default();
         for (block, body) in function.blocks.iter().enumerate() {
             for (index, inst) in body.instructions.iter().enumerate() {
                 match (inst.class.opcode, inst.operands.as_slice()) {

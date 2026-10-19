@@ -9,7 +9,7 @@
 
 use crate::spirv_module::{Instruction, Module, Operand};
 use spirv::{Op, Word};
-use std::collections::HashMap;
+use crate::fxhash::HashMap;
 
 fn logical_match(defs: &HashMap<Word, Instruction>, a: Word, b: Word, depth: u32) -> bool {
     if a == b {
@@ -49,7 +49,7 @@ pub(super) fn split_mismatched_copy_memory(module: &mut Module) -> bool {
         .iter()
         .filter_map(|i| i.result_id.map(|id| (id, i.clone())))
         .collect();
-    let mut value_type: HashMap<Word, Word> = HashMap::new();
+    let mut value_type: HashMap<Word, Word> = HashMap::default();
     for inst in module.types_global_values.iter().chain(module.functions.iter().flat_map(|f| f.all_inst_iter())) {
         if let (Some(id), Some(ty)) = (inst.result_id, inst.result_type) {
             value_type.insert(id, ty);

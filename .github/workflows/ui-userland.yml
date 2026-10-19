@@ -1,0 +1,120 @@
+name: UI user-space build
+
+on:
+  push:
+    branches: ['ui/coreimage-pr187-pr273']
+    paths:
+      - 'plugin/**'
+      - 'translator/**'
+      - 'build/build_userland_ci.sh'
+      - 'tools/compare_translator_ci.py'
+      - '.github/workflows/ui-userland.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ui-userland-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MACOSX_DEPLOYMENT_TARGET: '15.0'
+  CARGO_BUILD_JOBS: '3'
+  CARGO_HOME: ${{ github.workspace }}/.local/cloud-ci/cargo
+  CARGO_TARGET_DIR: ${{ github.workspace }}/.local/cloud-ci/target
+  UI_CI_OUT: ${{ github.workspace }}/.local/cloud-ci/output
+  VULKAN_HEADERS_COMMIT: acbb9391c0a597272800cd3f4363661c00a27c77
+
+jobs:
+  userland:
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Prepare Rust
+        id: rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
+          rustup target add x86_64-apple-darwin
+          echo "version=$(rustc --version | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            .local/cloud-ci/cargo/registry
+            .local/cloud-ci/cargo/git
+            .local/cloud-ci/target
+          key: ui-release-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('translator/**/Cargo.lock', 'translator/**/Cargo.toml', 'build/build_userland_ci.sh') }}-${{ github.sha }}
+          restore-keys: |
+            ui-release-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('translator/**/Cargo.lock', 'translator/**/Cargo.toml', 'build/build_userland_ci.sh') }}-
+      - name: Fetch pinned Vulkan headers
+        run: |
+          headers="$GITHUB_WORKSPACE/.local/cloud-ci/Vulkan-Headers"
+          mkdir -p "$headers"
+          git -C "$headers" init
+          git -C "$headers" fetch --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git "$VULKAN_HEADERS_COMMIT"
+          git -C "$headers" checkout --detach FETCH_HEAD
+          test "$(git -C "$headers" rev-parse HEAD)" = "$VULKAN_HEADERS_COMMIT"
+      - name: Compile and validate x86_64 user-space files
+        env:
+          VULKAN_INCLUDE: ${{ github.workspace }}/.local/cloud-ci/Vulkan-Headers/include
+        run: bash build/build_userland_ci.sh
+      - name: Upload candidate files
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-userland-x86_64-${{ github.sha }}
+          path: .local/cloud-ci/output/artifacts/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-build-logs-${{ github.sha }}
+          path: .local/cloud-ci/output/reports/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+
+  translator-tests:
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare Rust
+        id: rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
+          rustup target add x86_64-apple-darwin
+          echo "version=$(rustc --version | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            .local/cloud-ci/cargo/registry
+            .local/cloud-ci/cargo/git
+            .local/cloud-ci/target
+          key: ui-tests-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('translator/translator/Cargo.lock', 'translator/translator/Cargo.toml', 'tools/compare_translator_ci.py') }}-${{ github.sha }}
+          restore-keys: |
+            ui-tests-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('translator/translator/Cargo.lock', 'translator/translator/Cargo.toml', 'tools/compare_translator_ci.py') }}-
+      - name: Compare existing tests with unchanged v2.3.7
+        run: python3 tools/compare_translator_ci.py
+      - name: Upload test comparison and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-translator-tests-${{ github.sha }}
+          path: .local/cloud-ci/output/tests/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
