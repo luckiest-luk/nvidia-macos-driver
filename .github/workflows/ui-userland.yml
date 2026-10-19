@@ -8,6 +8,8 @@ on:
       - 'translator/**'
       - 'build/build_userland_ci.sh'
       - 'tools/compare_translator_ci.py'
+      - 'tools/restore_translator_fixtures.py'
+      - 'tools/test_translator_ci.py'
       - '.github/workflows/ui-userland.yml'
   workflow_dispatch:
 
@@ -91,6 +93,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Check test comparison and fixture recovery helpers
+        run: python3 -m unittest discover -s tools -p 'test_translator_ci.py'
       - name: Prepare Rust
         id: rust
         run: |
@@ -107,7 +111,7 @@ jobs:
           key: ui-tests-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('translator/translator/Cargo.lock', 'translator/translator/Cargo.toml', 'tools/compare_translator_ci.py') }}-${{ github.sha }}
           restore-keys: |
             ui-tests-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('translator/translator/Cargo.lock', 'translator/translator/Cargo.toml', 'tools/compare_translator_ci.py') }}-
-      - name: Compare existing tests with unchanged v2.3.7
+      - name: Restore upstream fixtures and compare tests with v2.3.7
         run: python3 tools/compare_translator_ci.py
       - name: Upload test comparison and logs
         if: always()

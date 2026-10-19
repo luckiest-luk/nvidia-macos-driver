@@ -4,7 +4,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
 
 BASE = 'e2b0e547a18841b7d944850b03c9e605df76720b'
@@ -33,18 +36,76 @@ def compare(before, after):
                                     if value == 'ignored' and before.get(name) in ('ok', 'FAILED'))}
 
 
-def run_tests(source, label):
+def run_logged(args, label):
     log = OUT / (label + '.log')
+    print('Running:', shlex.join(args), flush=True)
+    with log.open('w') as out:
+        code = subprocess.run(args, stdout=out, stderr=subprocess.STDOUT).returncode
+    text = log.read_text(errors='replace')
+    if code:
+        print(f'{label}: exit code {code}; last 100 log lines:', flush=True)
+        print('\n'.join(text.splitlines()[-100:]), flush=True)
+    return text, code
+
+
+def prepare_dependencies(baseline, candidate):
+    relative = Path('translator/translator')
+    before, after = baseline / relative, candidate / relative
+    if (before / 'Cargo.toml').read_bytes() != (after / 'Cargo.toml').read_bytes():
+        raise RuntimeError('Dependency manifests differ; cannot use one lock file for both test runs.')
+    shutil.copyfile(before / 'Cargo.lock', OUT / 'baseline-original.Cargo.lock')
+    # Upstream's lock file needs normalization. Preserve existing versions where
+    # possible, then use the exact same resolved lock for both source snapshots.
+    _, code = run_logged(['cargo', 'update', '--workspace', '--manifest-path',
+                          str(before / 'Cargo.toml')], 'dependencies')
+    if code:
+        raise RuntimeError(f'Dependency preparation failed (exit code {code}); see dependencies.log.')
+    shutil.copyfile(before / 'Cargo.lock', OUT / 'resolved.Cargo.lock')
+    shutil.copyfile(before / 'Cargo.lock', after / 'Cargo.lock')
+
+
+def missing_fixtures(source):
+    source = source.resolve()
+    crate = source / 'translator/translator'
+    missing = []
+    for path in sorted((crate / 'src').rglob('*.rs')):
+        for relative in re.findall(r'include_(?:str|bytes)!\s*\(\s*"([^"]+)"', path.read_text()):
+            target = (path.parent / relative).resolve()
+            if not target.is_file():
+                missing.append({'source': str(path.relative_to(source)),
+                                'fixture': str(target.relative_to(source))})
+    return missing
+
+
+def restore_fixtures(baseline, candidate):
+    output = OUT / 'restored-fixtures'
+    _, code = run_logged([sys.executable, str(ROOT / 'tools/restore_translator_fixtures.py'),
+                          '--output', str(output)], 'fixtures')
+    if code:
+        raise RuntimeError(f'Upstream fixture recovery failed (exit code {code}); see fixtures.log.')
+    provenance = json.loads((output / 'source.json').read_text())
+    for item in provenance['files']:
+        relative = Path('translator/translator/validation/fixtures/public') / item['name']
+        data = (output / item['name']).read_bytes()
+        for source in (baseline, candidate):
+            target = source / relative
+            if target.exists() and target.read_bytes() != data:
+                raise RuntimeError(f'Test fixture differs from the pinned upstream input: {relative}')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+    return provenance
+
+
+def run_tests(source, label):
     args = ['cargo', 'test', '--locked', '--lib', '--target', 'x86_64-apple-darwin',
             '--features', 'serde', '--manifest-path', str(source / 'translator/translator/Cargo.toml'),
             '--', '--test-threads=1', '--format=pretty', '--color=never']
     print('Running library tests:', label, flush=True)
-    with log.open('w') as out:
-        code = subprocess.run(args, stdout=out, stderr=subprocess.STDOUT).returncode
+    text, code = run_logged(args, label)
     try:
-        return parse_results(log.read_text(), code)
+        return parse_results(text, code)
     except ValueError as exc:
-        raise RuntimeError(f'{label}: {exc} Log: {log}') from exc
+        raise RuntimeError(f'{label}: {exc} Cargo exit code: {code}. Log: {OUT / (label + ".log")}') from exc
 
 
 def main():
@@ -64,8 +125,21 @@ def main():
                 subprocess.run(['git', '-C', str(ROOT), 'archive', BASE, 'translator/translator'],
                                stdout=out, check=True)
             subprocess.run(['tar', '-xf', str(archive), '-C', str(baseline)], check=True)
+            candidate = baseline / 'candidate'
+            shutil.copytree(ROOT / 'translator/translator', candidate / 'translator/translator',
+                            ignore=shutil.ignore_patterns('target', '.local', '.git', '__pycache__'))
+            report['missing_fixtures'] = {label: missing_fixtures(source) for label, source in
+                                          [('baseline', baseline), ('candidate', candidate)]}
+            if any(report['missing_fixtures'].values()):
+                report['restored_fixtures'] = restore_fixtures(baseline, candidate)
+                report['missing_fixtures'] = {label: missing_fixtures(source) for label, source in
+                                              [('baseline', baseline), ('candidate', candidate)]}
+            if any(report['missing_fixtures'].values()):
+                raise RuntimeError('Compile-time test fixtures are missing; restore the real .ll files '
+                                   'before comparing tests. See missing_fixtures in this report.')
+            prepare_dependencies(baseline, candidate)
             before = run_tests(baseline, 'baseline')
-            after = run_tests(ROOT, 'candidate')
+            after = run_tests(candidate, 'candidate')
         report.update({'baseline': before, 'candidate': after, **compare(before, after)})
         report['state'] = 'passed' if not any(report[key] for key in
             ('new_failures', 'missing_tests', 'newly_ignored')) else 'failed'
