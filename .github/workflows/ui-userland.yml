@@ -113,7 +113,11 @@ jobs:
           restore-keys: |
             ui-tests-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('translator/translator/Cargo.lock', 'translator/translator/Cargo.toml', 'tools/compare_translator_ci.py') }}-
       - name: Prepare authored fixtures and compare tests with v2.3.7
-        run: python3 tools/compare_translator_ci.py
+        run: |
+          brew install spirv-tools
+          export PATH="$(brew --prefix spirv-tools)/bin:$PATH"
+          spirv-val --version
+          python3 tools/compare_translator_ci.py
       - name: Upload test comparison and logs
         if: always()
         uses: actions/upload-artifact@v7

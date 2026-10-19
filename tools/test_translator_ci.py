@@ -61,6 +61,16 @@ class FixtureTests(unittest.TestCase):
         states[recovery.TEST_NAMES[0]] = 'FAILED'
         self.assertEqual(comparison.fixture_test_failures(states), [recovery.TEST_NAMES[0]])
 
+    def test_ignored_reason_is_counted_and_missing_results_are_rejected(self):
+        log = ('test passing ... ok\n'
+               'test failing ... FAILED\n'
+               'test skipped ... ignored, known defect: device-address store\n'
+               'test result: FAILED. 1 passed; 1 failed; 1 ignored;\n')
+        self.assertEqual(comparison.parse_results(log, 101),
+                         {'passing': 'ok', 'failing': 'FAILED', 'skipped': 'ignored'})
+        with self.assertRaisesRegex(ValueError, 'Could not identify every test result'):
+            comparison.parse_results(log.replace('test passing ... ok\n', ''), 101)
+
     def test_real_baseline_archive_runs_with_same_lock_and_inputs(self):
         output = self.root / 'comparison'
         original_lock = comparison.ROOT / 'translator/translator/Cargo.lock'

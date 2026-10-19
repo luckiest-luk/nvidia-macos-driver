@@ -21,7 +21,7 @@ def parse_results(text, code):
     match = re.search(r'test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;', text)
     if not match or code not in (0, 101):
         raise ValueError('Test compilation or execution did not complete; inspect the log.')
-    states = dict(re.findall(r'^test (.+) \.\.\. (ok|FAILED|ignored)$', text, re.M))
+    states = dict(re.findall(r'^test (.+) \.\.\. (ok|FAILED|ignored)(?:, [^\n]*)?$', text, re.M))
     if not states:
         raise ValueError('No library tests ran; refusing an empty comparison.')
     counts = {state: sum(value == state for value in states.values()) for state in ('ok', 'FAILED', 'ignored')}
