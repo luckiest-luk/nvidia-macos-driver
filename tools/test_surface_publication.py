@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Force CPU import to overlap GPU surface publication in production methods."""
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -36,6 +37,8 @@ static IOReturn IOSurfaceUnlock(IOSurfaceRef s, unsigned opts, uint32_t *seed) {
     return 0;
 }
 static void *IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef s, uint32_t p) { return s->cpu; }
+static void *IOSurfaceGetBaseAddress(IOSurfaceRef s) { return s->cpu; }
+static size_t IOSurfaceGetAllocSize(IOSurfaceRef s) { return sizeof s->cpu; }
 static size_t IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef s, uint32_t p) { return 4; }
 static uint32_t nvmtl_vram_gen(IOSurfaceRef s, NSUInteger p) { return 1; }
 static int nvmtl_vram_tag_current(IOSurfaceRef s, NSUInteger p, unsigned seed) { return gpu_seed == seed; }
@@ -54,6 +57,12 @@ static BOOL nvmtl_ws_kernel_waits(void){return NO;}
 static void nvmtl_ws_mark(uint32_t sid,BOOL pending){(void)sid;(void)pending;}
 static void nvtrace(const char *f,...){(void)f;}
 static int nvmtl_vk_image_write(void *q, Image *i, void *base, size_t row) {
+    memcpy(i->gpu,base,4); uploads++; return 0;
+}
+static unsigned host_attempts;
+static int nvmtl_vk_image_write_host(void *q, Image *i, void *base, size_t row, size_t bytes) {
+    assert(bytes == 4); host_attempts++;
+    if (getenv("TEST_HOST_IMPORT_FAIL")) return -1;
     memcpy(i->gpu,base,4); uploads++; return 0;
 }
 static int nvmtl_vk_image_read(void *q, Image *i, void *base, size_t row) {
@@ -100,6 +109,8 @@ int main(int argc, char **argv) { @autoreleasepool {
     // A later CPU edit must still be imported once publication has finished.
     s.seed++; memset(s.cpu,71,4); [alias nvmtlSurfaceIn];
     assert(uploads==1); assert(!memcmp((argc>1?alias:t)->_i.gpu,s.cpu,4));
+    const char *mode=getenv("NVMTL_SURFIN_UPLOAD");
+    assert(host_attempts == ((mode && !strcmp(mode,"cpu")) ? 0 : 1));
     // Publication after the commit's VRAM mark (WindowServer, an NVAccel whose page-off waits) runs on the thread that
     // releases the pending marks, so it never waits for the accelerator lock: busy, the commit's mark stands and nothing
     // is copied (a copy would block in the read stub and fail); free, the surface is marked again.
@@ -136,3 +147,6 @@ with tempfile.TemporaryDirectory() as directory:
                     str(path / 'test.m'), '-o', str(path / 'test')], check=True)
     subprocess.run([str(path / 'test')], check=True)
     subprocess.run([str(path / 'test'), 'shared'], check=True)
+    for mode in ({'TEST_HOST_IMPORT_FAIL': '1'}, {'NVMTL_SURFIN_UPLOAD': 'cpu'}):
+        for args in ([], ['shared']):
+            subprocess.run([str(path / 'test'), *args], check=True, env={**os.environ, **mode})
