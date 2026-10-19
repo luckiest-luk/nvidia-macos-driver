@@ -301,6 +301,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     thread_call_t fCursorCall = nullptr;
     IOSimpleLock *fCurStateLock = nullptr;
     static void cursorFire(thread_call_param_t p0, thread_call_param_t);
+    void stopCursorCall();
     bool fCursorEnabled = false;
     bool cursorInit();
     bool cursorApply(bool imageChanged = false);
@@ -1769,7 +1770,10 @@ bool NVRMNVDAFramebuffer::cursorInit()
         return false;
     }
     if (!fCurStateLock) fCurStateLock = IOSimpleLockAlloc();
-    if (!fCursorCall) fCursorCall = thread_call_allocate(cursorFire, this);
+    // A cursor move can arrive while cursorApply waits for the display gate. Keep
+    // one callback running and coalesce later moves into one deferred callback.
+    if (!fCursorCall) fCursorCall = thread_call_allocate_with_options(
+        cursorFire, this, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
     if (!fCurStateLock || !fCursorCall) { FBLOG("cursor: lock or thread call allocation FAILED"); return false; }
     NvU32 dim = fCurMaxPx;
     if (dim > 256) dim = 256;
@@ -1935,8 +1939,23 @@ void NVRMNVDAFramebuffer::cursorFire(thread_call_param_t p0, thread_call_param_t
 {
     NVRMNVDAFramebuffer *me = (NVRMNVDAFramebuffer *)p0;
     NVRMCallReference callReference(me);
+    // stopCursorCall takes the same gate before it frees cursor resources. A
+    // callback waiting here must see fStopping before entering cursorApply.
+    NVRMDisplayGate gate;
+    if (!gate.valid()) return;
     if (OSAddAtomic(0, &me->fStopping)) return;
     me->cursorApply();   // takes the display gate
+}
+void NVRMNVDAFramebuffer::stopCursorCall()
+{
+    if (!fCursorCall) return;
+    // fStopping prevents new submissions. Drain any cursorApply holding the
+    // gate. A callback still waiting for the gate skips the work when released;
+    // its scheduleCall retain keeps this framebuffer alive until it returns.
+    NVRMDisplayGate gate;
+    if (thread_call_cancel(fCursorCall)) release();
+    thread_call_free(fCursorCall);
+    fCursorCall = nullptr;
 }
 void NVRMNVDAFramebuffer::barsFire(thread_call_param_t p0, thread_call_param_t)
 {
@@ -2341,7 +2360,8 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
         if (sl) IORecursiveLockUnlock(sl);
         if (mine) release();
     }
-    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fGpuWake, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fCursorCall};
+    stopCursorCall();
+    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fGpuWake, &fBars, &fVblTimer, &fSampler, &fHeadProbe};
     for (unsigned i = 0; i < sizeof calls / sizeof calls[0]; ++i) {
         thread_call_t call = *calls[i];
         if (!call) continue;
