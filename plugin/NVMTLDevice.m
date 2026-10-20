@@ -186,7 +186,7 @@ static bool nvmtl_accel_armed(void)
 // one: on an RTX 3070 Laptop (issue #65, measured against Apple's software codecs) H.264 decode showed shifted macroblock
 // rows and a green stripe, and both encoders produced torn pictures. The decoder's only difference is its untiling mode
 // (1 = Blackwell, 0 = classic), so earlier GPUs load libnvdec_h264_t2d.dylib, the same library with mode 0 (51 dB on
-// GA104). The encoders are not registered on them, so apps use Apple's encoder until they are fixed for those GPUs.
+// GA104). The encoders below likewise select libraries built for the card's generation.
 // Set from the I/O registry where no Metal device (and so no Vulkan device name) exists: -1 = unknown, use the name.
 static int g_video_blackwell = -1;
 // One string from the per-generation profile NVRM publishes on the GPU's PCI device ("nvrm-gpu-profile": chip,
@@ -218,6 +218,36 @@ static bool nvmtl_video_is_blackwell(void)
         return g_video_blackwell == 1;
     }
     return strstr(nvmtl_vk_device_name(), "NVK GB") != NULL;
+}
+static bool nvmtl_nvenc_is_turing(const char *generation)
+{
+    if (!strcmp(generation, "Turing")) return true;
+    // TU116 publishes a separate GTX 16 profile but uses the Turing NVC4B7 encoder.
+    // Keep TU117 separate: its encoder has not been qualified with these libraries.
+    char chip[32];
+    return !strcmp(generation, "Turing GTX 16")
+        && nvmtl_gpu_profile_string(CFSTR("chip"), chip, sizeof chip)
+        && !strcmp(chip, "TU116");
+}
+static const char *nvmtl_nvenc_hevc_library_for_this_gpu(void)
+{
+    char gen[32];
+    if (!nvmtl_gpu_profile_string(CFSTR("generation"), gen, sizeof gen))
+        return nvmtl_video_is_blackwell() ? "libnvenc_hevc.dylib" : NULL;
+    if (!strcmp(gen, "Blackwell")) return "libnvenc_hevc.dylib";
+    if (!strcmp(gen, "Ampere")) return "libnvenc_hevc_ga10x.dylib";
+    if (nvmtl_nvenc_is_turing(gen)) return "libnvenc_hevc_tu10x.dylib";
+    return NULL;
+}
+static const char *nvmtl_nvenc_library_for_this_gpu(void)
+{
+    char gen[32];
+    if (!nvmtl_gpu_profile_string(CFSTR("generation"), gen, sizeof gen))
+        return nvmtl_video_is_blackwell() ? "libnvenc_h264.dylib" : NULL;
+    if (!strcmp(gen, "Blackwell")) return "libnvenc_h264.dylib";
+    if (!strcmp(gen, "Ampere")) return "libnvenc_h264_ga10x.dylib";
+    if (nvmtl_nvenc_is_turing(gen)) return "libnvenc_h264_tu10x.dylib";
+    return NULL;
 }
 static void nvmtl_nvdec_register(void)
 {
@@ -251,7 +281,8 @@ static void nvmtl_nvenc_register(void)
     dispatch_once(&once, ^{
         const char *me = getprogname();
         if (getenv("NVMTL_NO_NVENC")) { nvlog("nvenc: NVMTL_NO_NVENC set - not registering in %s", me); return; }
-        if (!nvmtl_video_is_blackwell()) { nvlog("nvenc: %s is not Blackwell - H.264 encode stays on Apple's encoder", nvmtl_vk_device_name()); return; }
+        const char *lib = nvmtl_nvenc_library_for_this_gpu();
+        if (!lib) { nvlog("nvenc: no encoder library for %s - H.264 encode stays on Apple's encoder", nvmtl_vk_device_name()); return; }
         if (!strcmp(me, "WindowServer")) return;
         typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
         RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoEncoderWithInfo");
@@ -260,7 +291,7 @@ static void nvmtl_nvenc_register(void)
         if (!dladdr((const void *)nvmtl_nvenc_register, &di) || !di.dli_fname) { nvlog("nvenc: dladdr failed - not registering"); return; }
         char dir[1024], path[1200];
         strlcpy(dir, di.dli_fname, sizeof dir);
-        snprintf(path, sizeof path, "%s/libnvenc_h264.dylib", dirname(dir));
+        snprintf(path, sizeof path, "%s/%s", dirname(dir), lib);
         void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!h) { nvlog("nvenc: dlopen %s FAILED: %s", path, dlerror()); return; }
         void *fac = dlsym(h, "NVEncH264_CreateInstance");
@@ -275,8 +306,7 @@ static void nvmtl_nvenc_register(void)
 }
 // An encoder built outside this driver can register itself beside ours and let VTRating decide which
 // one an app gets, so both can be installed and compared. The one this was written for reports H.264
-// at about 5 ms where the library we ship takes about 12, and it runs on Turing, Ampere and Ada,
-// which nvmtl_nvenc_register above turns away for not being Blackwell.
+// at about 5 ms where the library we ship takes about 12, and it runs on Turing, Ampere and Ada.
 // Off unless NVMTL_NVENCVT names this process (or is 1), from nvrm610.conf or the environment.
 // ⛔ This loads code into every app that encodes, so the library and the directory holding it must be
 // ours and nobody else's. The firmware taught this: it used to sit in /Users/Shared, which is mode
@@ -401,7 +431,8 @@ static void nvmtl_nvenc_hevc_register(void)
     dispatch_once(&once, ^{
         const char *me = getprogname();
         if (getenv("NVMTL_NO_NVENC_HEVC")) { nvlog("nvenc: NVMTL_NO_NVENC_HEVC set - not registering HEVC in %s", me); return; }
-        if (!nvmtl_video_is_blackwell()) { nvlog("nvenc: %s is not Blackwell - HEVC encode stays on Apple's encoder", nvmtl_vk_device_name()); return; }
+        const char *lib = nvmtl_nvenc_hevc_library_for_this_gpu();
+        if (!lib) { nvlog("nvenc: no HEVC encoder library for %s - HEVC encode stays on Apple's encoder", nvmtl_vk_device_name()); return; }
         if (!strcmp(me, "WindowServer")) return;
         typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
         RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoEncoderWithInfo");
@@ -410,7 +441,7 @@ static void nvmtl_nvenc_hevc_register(void)
         if (!dladdr((const void *)nvmtl_nvenc_hevc_register, &di) || !di.dli_fname) { nvlog("nvenc: dladdr failed - not registering HEVC"); return; }
         char dir[1024], path[1200];
         strlcpy(dir, di.dli_fname, sizeof dir);
-        snprintf(path, sizeof path, "%s/libnvenc_hevc.dylib", dirname(dir));
+        snprintf(path, sizeof path, "%s/%s", dirname(dir), lib);
         void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!h) { nvlog("nvenc: dlopen %s FAILED: %s", path, dlerror()); return; }
         void *fac = dlsym(h, "NVEncHEVC_CreateInstance");
