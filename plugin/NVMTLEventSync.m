@@ -318,8 +318,15 @@ static int nvmtl_skip_empty_on(void) {
     part->commands = _c;
     memset(&_c, 0, sizeof(_c));
     part->resources = [(NVMTLResSet *)_resources nvmtlTakeAll]; part->surfaces = [_surfDirty copy];
-    // Another process may read an IOSurface once its writer is scheduled, and nothing orders its queue after ours.
-    static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && e[0] == '1'; }
+    // Chromium hands IOSurfaces to CoreAnimation after the scheduled handler, relying on the kernel to track their
+    // pending writes. Only WindowServer registers those marks here. Other writers must publish before reporting
+    // scheduled, or an IOSurface lock / another process can read the previous frame while this one is still drawing.
+    // Presented drawables already hand off from nvmtlFinishExecution, after publication.
+    static int after = -1;
+    if (after < 0) {
+        const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES");
+        after = e ? e[0] == '1' : !nvmtl_ws_kernel_waits();
+    }
     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
     for (NVMTLTexture *s in part->surfaces) if (after && s != drawable) _scheduleAfterPublish = YES;
     part->scratch = [_scratch copy]; part->signalEvent = event; part->value = value;
