@@ -572,6 +572,8 @@ static void nvmtl_install_hw_resource_pools(id dev)
         nvlog("  NVK did not come up in this process - refusing to be the Metal device for %s", getprogname());
         return nil;
     }
+    // Open alongside the device's other kernel connections, rather than on the first draw after an app enters its sandbox.
+    (void)nvmtl_vk_surface_sync_available();
     nvmtl_gl_caps_enable();
     if (nvmtl_vk_vendor() == 0x10de) {   /* NVDEC/NVENC are NVIDIA engines reached through NVRM */
         nvmtl_nvdec_register();

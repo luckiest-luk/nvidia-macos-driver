@@ -118,7 +118,7 @@ typedef struct { int unused; } nvmtl_inflight;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied { if (events) [events addObject:[NSString stringWithFormat:@"o%d:%d",_tag,(int)dirtied]]; return YES; }
 @end
 @interface NVMTLCommandBuffer : NSObject { @public
-    BOOL _executionDone, _committed, _commitMarking; NSError *_cbError;
+    BOOL _executionDone, _committed, _commitMarking, _surfaceSyncAsyncFinish; NSError *_cbError;
     NSUInteger _nextSubmit, _nextPart; NSMutableArray *_parts; double _legacyKernelStart;
 }
 - (BOOL)nvmtlSubmitAhead;
@@ -128,6 +128,14 @@ typedef struct { int unused; } nvmtl_inflight;
 - (void)nvmtlFinishExecution:(NSError *)error;
 @end
 static _Atomic unsigned long long gsub_inflight, gsub_peak, gsub_ahead, gEvFold, gEvFoldEmpty, gSkipEmpty;
+// The new cross-process protocol is unavailable in this copy/WindowServer harness; exercise its fallback arm.
+static BOOL surfaceDependenciesReady = YES;
+static BOOL nvmtl_surface_sync_dependencies(NVMTLCommandBuffer *cb) { return surfaceDependenciesReady; }
+static BOOL nvmtl_surface_sync_part_landed(NVMTLCommandBuffer *cb, NSUInteger index, NSArray *surfaces) {
+    BOOL ok = YES;
+    for (NVMTLTexture *texture in surfaces) if (![texture nvmtlSurfaceOut]) ok = NO;
+    return ok;
+}
 static NSMutableArray *nvmtl_quarantined_parts;
 static unsigned begins, waits, finishes, scheduled;
 static int submitResult; static BOOL allocationFails;
@@ -200,6 +208,10 @@ int main(void) { @autoreleasepool {
     TestEvent *event=[TestEvent new]; event->cpu=cpu;
     memset(cpu,31,16); expectedPixel=31; writtenPixel=47; event->expected=47;
     NVMTLCommandBuffer *cb=makeCommand(resources,event);
+    surfaceDependenciesReady=NO;
+    assert(![cb nvmtlSubmitAhead] && ![cb nvmtlAdvancePart]);
+    assert(!begins && !waits && !scheduled && !cb->_nextPart && !cb->_nextSubmit);
+    surfaceDependenciesReady=YES;
     assert([cb nvmtlAdvancePart]);
     assert(cb->_executionDone && !cb->_cbError && waits==1 && uploads==1 && downloads==1 && event->signals==1);
     // Failed submissions must neither download untrusted bytes nor signal completion.

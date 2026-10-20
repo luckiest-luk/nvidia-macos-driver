@@ -7,6 +7,7 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include "../kexts/NVRM/nvrm_surface_sync_abi.h"
 const char *nvmtl_image_ident(const void *addr, char *out, size_t n);
 typedef struct { void *buf; void *mem; void *map; size_t size; size_t alloc; int placed; void *pool; size_t poff; int imported; int bar1; size_t moff; int sparse, sysmem; } nvk_buffer;
 #include "nvmtl_sample_positions.h"
@@ -360,3 +361,5 @@ int nvmtl_vk_surface_dirty(uint32_t surfaceID, uint32_t plane);
 int nvmtl_vk_surface_dirty_try(uint32_t surfaceID, uint32_t plane);
 uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending);
 int nvmtl_vk_accel_surface_wait(void);
+int nvmtl_vk_surface_sync_available(void);
+int nvmtl_vk_surface_sync(unsigned op, uint32_t sid, uint32_t plane, uint64_t *ticket, int failed);

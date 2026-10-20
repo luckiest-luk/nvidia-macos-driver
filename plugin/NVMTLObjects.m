@@ -1024,6 +1024,7 @@ static void nvmtl_surface_overwrite_recorded(NVMTLCommandBuffer *cb, NVMTLTextur
     [cb->_surfOverwrites addObject:r];
 }
 static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t);
+static BOOL nvmtl_surface_sync_read(NVMTLCommandBuffer *cb, NVMTLTexture *t);
 static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     if (!t) return;
     NVMTLTexture *r = t->_parent ? t->_parent : t;
@@ -1032,6 +1033,9 @@ static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     // Importing the old CPU surface here would run ahead of this buffer and
     // overwrite that earlier GPU write. Queue order or the application's event supplies the dependency.
     if (nvmtl_surface_pending_write(cb, r)) return;
+    // Shared VRAM can be imported before its producer finishes. Capture that dependency even on SurfaceIn's seed/tag
+    // fast path, and leave the wait to the submission worker rather than the compositor's encoding thread.
+    if (nvmtl_surface_sync_read(cb, r)) return;
     [t nvmtlSurfaceIn];
 }
 static unsigned nvmtl_surf_id(NVMTLTexture *t) { NVMTLTexture *r = (t && t->_parent) ? t->_parent : t; return (r && r->_surf) ? (unsigned)IOSurfaceGetID(r->_surf) : 0u; }

@@ -1935,6 +1935,40 @@ int nvmtl_vk_accel_surface_wait(void)
     IOObjectRelease(s);
     return on == 1;
 }
+static io_connect_t g_surface_sync_client;
+static void nvmtl_surface_sync_open(void)
+{
+    const char *e = getenv("NVMTL_ASYNC_SURFACES");
+    // Experimental until the matching kernel/plugin pair has passed the cross-process and mixed-backing probes.
+    if (!e || e[0] != '1') return;
+    if (nvmtl_vk_vendor() != 0x10de) return;
+    io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
+    if (!service) return;
+    CFTypeRef v = IORegistryEntryCreateCFProperty(service, CFSTR("NVAccelSurfaceSync"), kCFAllocatorDefault, 0);
+    int version = 0;
+    if (v && CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &version);
+    if (v) CFRelease(v);
+    if (version == NV_SURFACE_SYNC_VERSION)
+        (void)IOServiceOpen(service, mach_task_self(), NV_SURFACE_SYNC_CLIENT, &g_surface_sync_client);
+    IOObjectRelease(service);
+}
+int nvmtl_vk_surface_sync_available(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, nvmtl_surface_sync_open);
+    return g_surface_sync_client != IO_OBJECT_NULL;
+}
+int nvmtl_vk_surface_sync(unsigned op, uint32_t sid, uint32_t plane, uint64_t *ticket, int failed)
+{
+    if (!nvmtl_vk_surface_sync_available()) return -1;
+    struct NVSurfaceSyncRequest p = {NV_SURFACE_SYNC_VERSION, op, sid, plane,
+        failed ? NV_SURFACE_SYNC_FAILED : NV_SURFACE_SYNC_READY, 0, ticket ? *ticket : 0};
+    size_t size = sizeof p;
+    kern_return_t kr = IOConnectCallStructMethod(g_surface_sync_client, 0, &p, sizeof p, &p, &size);
+    if (kr != KERN_SUCCESS || size != sizeof p) return -1;
+    if (ticket) *ticket = p.ticket;
+    return (int)p.status;
+}
 int nvmtl_vk_surface_vram(uint32_t surfaceID, uint32_t plane, size_t need, nvk_buffer *out)
 {
     memset(out, 0, sizeof *out);

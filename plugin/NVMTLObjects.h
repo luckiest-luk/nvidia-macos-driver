@@ -120,6 +120,10 @@ extern id gNVMTLMainDevice;
   NSMutableSet *_resources;
   NSMutableSet *_surfDirty;
   NSMutableSet *_surfOverwrites; // contents defined by writes recorded in this command buffer
+  NSMutableDictionary *_surfaceSyncWrites, *_surfaceSyncReads;
+  NSMutableArray *_surfaceSyncLatePublications;
+  BOOL _surfaceSyncAsyncFinish;
+  uint64_t _surfaceSyncReadStart;
   unsigned _nEnc, _nEnd, _nHandlers, _nStatus, _nEnqueue, _nLabel, _nPresent, _nWait;
   unsigned _nEncSealed;
   CFTimeInterval _gpuStart, _gpuEnd;

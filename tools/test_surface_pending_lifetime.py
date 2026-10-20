@@ -23,6 +23,8 @@ static unsigned gCntResFree;
 static void OSAddAtomic64(int n, unsigned *value) { *value+=n; }
 struct IOAccelResource2 { unsigned freed=0; void free() { freed++; } };
 struct NVResource : IOAccelResource2 { Descriptor *fApDesc=nullptr; void free(); };
+// The owned-write timeline has its own destructor/reuse tests in test_surface_timeline.cpp.
+static void nvSurfSyncForget(void *) {}
 '''
 checks = r'''
 int main() {

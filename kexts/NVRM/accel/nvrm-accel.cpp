@@ -11,6 +11,8 @@
 #endif
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOUserClient.h>
+#include "nv_surface_timeline.h"
 #include <IOKit/pci/IOPCIDevice.h>
 #include <pexpert/pexpert.h>
 #include <libkern/OSKextLib.h>
@@ -54,7 +56,10 @@ void clock_interval_to_deadline(uint32_t interval, uint32_t scale_factor, uint64
 uint64_t mach_absolute_time(void);
 void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 void proc_selfname(char *buf, int size);
+task_t current_task(void);
 }
+static IOReturn nvSurfSyncNewClient(IOService *, task_t, void *, IOUserClient **);
+static void nvSurfSyncForget(void *resource);
 static volatile SInt64 gCntVmAlloc, gCntVmAllocBytes, gCntVmDealloc, gCntVmDeallocBytes, gCntVmRefused,
                        gCntResNew, gCntResFree, gCntMapCommit, gCntMapRelease, gCntMapFree;
 static void nvaccelInstallSysctl(void);
@@ -480,6 +485,8 @@ public:
     IOService *fNVRM = nullptr;
     IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
                            IOUserClient **handler) APPLE_KEXT_OVERRIDE {
+        if (type == NV_SURFACE_SYNC_CLIENT)
+            return nvSurfSyncNewClient(this, owningTask, securityID, handler);
         if ((type & 0xFFFF0000u) != 0x4E560000u) {
             IOReturn fr = IOGraphicsAccelerator2::newUserClient(owningTask, securityID, type, handler);
             if (fUcLogged < 40) { fUcLogged++;
@@ -611,6 +618,7 @@ public:
             // accelerator that does not wait, that mark would let a CPU lock or a copied present read a surface before
             // its pixels landed, so the plugin keeps marking them after the GPU finishes.
             setProperty("NVAccelSurfaceWait", 1ULL, 32);
+            setProperty("NVAccelSurfaceSync", (unsigned long long)NV_SURFACE_SYNC_VERSION, 32);
             registerService(); ALOG("registerService() called — Metal can now find MetalPluginName=%s", "NVMTLDriver");
             gAccel = this; gEnableAccel = &NVAccel::enableFromHook;
             for (unsigned i = 0; i < NV_CARRIERS; i++) {
@@ -773,6 +781,7 @@ static void nvSVForgetResource(NVResource *resource);
 
 void NVResource::free()
 {
+    nvSurfSyncForget(this);
     nvSVForgetResource(this);
     if (fApDesc) { fApDesc->release(); fApDesc = nullptr; }
     OSAddAtomic64(1, &gCntResFree);
@@ -1006,7 +1015,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         // stale, one-colour buffer on the panel every other frame: full-screen flicker, 5 of 40 flicker recordings
         // (1.13-1.14.1), nvaccel_iop_blank about half of every copied frame, never on machines whose frames all flip.
         // Such a frame now keeps the previous picture on the panel instead.
-        nvSurfWaitReady(s->getSurfaceID());   // a copied frame is read here, so its GPU work must be done first
+        if (!nvSurfWaitReady(s->getSurfaceID())) return kIOReturnSuccess; // keep the previous frame on failure
         if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
         const unsigned fmt = s->getPixelFormat();
         if (fmt != 0x42475241u) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA", s->getSurfaceID(), fmt);
@@ -1178,6 +1187,39 @@ struct NVSurfPending { unsigned int id; unsigned int seq; };
 static NVSurfPending gSurfPend[32];
 static unsigned int gSurfPendSeq;
 static IOLock *gSurfPendLock;
+static NVSurfaceTimeline gSurfTimeline;
+static IOLock *gSurfTimelineLock;
+static IOLock *nvSurfTimelineLock()
+{
+    if (!gSurfTimelineLock) {
+        IOLock *l = IOLockAlloc();
+        if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gSurfTimelineLock)) IOLockFree(l);
+    }
+    return gSurfTimelineLock;
+}
+static void nvSurfSyncForget(void *resource)
+{
+    IOLock *l = gSurfTimelineLock;
+    if (!l) return;
+    IOLockLock(l); nvSurfaceForget(&gSurfTimeline, resource); IOLockUnlock(l);
+}
+static bool nvSurfSyncWait(unsigned id)
+{
+    IOLock *l = gSurfTimelineLock;
+    if (!l || !id) return true;
+    uint64_t deadline = 0;
+    clock_interval_to_deadline(5000, kMillisecondScale, &deadline);
+    IOLockLock(l);
+    unsigned long long ticket;
+    unsigned status = nvSurfaceSnapshot(&gSurfTimeline, id, &ticket);
+    while (status == NV_SURFACE_SYNC_PENDING && mach_absolute_time() < deadline) {
+        IOLockSleepDeadline(l, &gSurfTimeline, deadline, THREAD_UNINT);
+        status = nvSurfacePoll(&gSurfTimeline, id, ticket);
+    }
+    IOLockUnlock(l);
+    // A failed or timed-out producer must never expose unfinished pixels.
+    return status == NV_SURFACE_SYNC_READY;
+}
 static IOLock *nvSurfLock()
 {
     if (!gSurfPendLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gSurfPendLock)) IOLockFree(l); }
@@ -1206,6 +1248,7 @@ static void nvSurfMark(unsigned int id, bool pending)
 }
 static bool nvSurfWaitReady(unsigned int id)
 {
+    if (!nvSurfSyncWait(id)) return false;
     IOLock *l = gSurfPendLock;
     if (!l || !id || !gSurfGpuOn) return true;   // switched off: marks left from before never hold a swap
     uint64_t start = mach_absolute_time(), deadline = 0;
@@ -1562,6 +1605,135 @@ static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigne
     return kIOReturnSuccess;
 }
 
+// This connection owns its writes. A different connection (including one in the same task) cannot retire them.
+class NVSurfaceSyncClient : public IOUserClient {
+    OSDeclareDefaultStructors(NVSurfaceSyncClient)
+    task_t fTask = nullptr;
+    bool fClosed = false;
+public:
+    bool initWithTask(task_t task, void *security, UInt32 type, OSDictionary *properties) override {
+        if (!IOUserClient::initWithTask(task, security, type, properties)) return false;
+        fTask = task;
+        return nvSurfTimelineLock() != nullptr;
+    }
+    IOReturn clientClose() override {
+        IOLock *l = gSurfTimelineLock;
+        if (l) {
+            void *surfaces[kNVSurfaceOwnerTickets]; unsigned n = 0;
+            IOLockLock(l);
+            fClosed = true;
+            for (auto &e : gSurfTimeline.entries) if (e.owner == this) {
+                surfaces[n++] = e.surface;
+                e.surface = nullptr; e.owner = nullptr; e.failed = true;
+            }
+            IOLockWakeup(l, &gSurfTimeline, false);
+            IOLockUnlock(l);
+            // release can destroy the cache and re-enter nvSurfSyncForget. Never do it under our lock.
+            for (unsigned i = 0; i < n; ++i) ((OSObject *)surfaces[i])->release();
+        }
+        terminate();
+        return kIOReturnSuccess;
+    }
+    IOReturn clientDied() override { return clientClose(); }
+    static IOReturn call(OSObject *target, void *, IOExternalMethodArguments *args) {
+        auto *self = OSDynamicCast(NVSurfaceSyncClient, target);
+        if (!self || current_task() != self->fTask) return kIOReturnNotPermitted;
+        NVSurfaceSyncRequest p = *(const NVSurfaceSyncRequest *)args->structureInput;
+        if (p.version != NV_SURFACE_SYNC_VERSION || p.reserved || p.plane > 15 ||
+            p.op < NV_SURFACE_SYNC_BEGIN || p.op > NV_SURFACE_SYNC_POLL) return kIOReturnBadArgument;
+        IOLock *l = gSurfTimelineLock;
+        if (!l) return kIOReturnNotReady;
+        void *released = nullptr;
+        if (p.op == NV_SURFACE_SYNC_END) {
+            if (p.status != NV_SURFACE_SYNC_READY && p.status != NV_SURFACE_SYNC_FAILED) return kIOReturnBadArgument;
+            IOLockLock(l);
+            p.status = self->fClosed ? NV_SURFACE_SYNC_INVALID :
+                nvSurfaceEnd(&gSurfTimeline, self, p.surfaceID, p.ticket, p.status == NV_SURFACE_SYNC_FAILED, &released);
+            if (p.status == NV_SURFACE_SYNC_READY) {
+                unsigned long long latest;
+                if (nvSurfaceSnapshot(&gSurfTimeline, p.surfaceID, &latest) == NV_SURFACE_SYNC_FAILED)
+                    p.status = NV_SURFACE_SYNC_FAILED;
+            }
+            IOLockWakeup(l, &gSurfTimeline, false);
+            IOLockUnlock(l);
+        } else {
+            // Authenticate access with IOSurfaceRoot and the connection's task, never a caller-supplied PID.
+            if (!gNVSVRoot) return kIOReturnNotReady;
+            void *surf = _ZN13IOSurfaceRoot13lookupSurfaceEjP4task(gNVSVRoot, p.surfaceID, self->fTask);
+            if (!surf) return kIOReturnNotPermitted;
+            if (p.op == NV_SURFACE_SYNC_BEGIN) {
+                NVAccel *a = OSDynamicCast(NVAccel, self->getProvider());
+                p.status = NV_SURFACE_SYNC_BUSY;
+                // CPU page-off can hold this lock while waiting on an older ticket. Commit must never wait for it.
+                if (a && nvFamLock(a, true)) {
+                    void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej(a, surf, p.plane);
+                    OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
+                    NVResource *res = OSDynamicCast(NVResource, ctx);
+                    NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
+                    const bool backing = res && vm && nvAccelRestoreParkedForDirty(res, vm, p.plane) && vm->fRmHandle;
+                    IOLockLock(l);
+                    if (!self->fClosed && backing) {
+                        ((OSObject *)surf)->retain();
+                        p.status = nvSurfaceBegin(&gSurfTimeline, self, p.surfaceID, res, surf, &p.ticket, false);
+                        if (p.status != NV_SURFACE_SYNC_READY) released = surf;
+                    }
+                    IOLockUnlock(l);
+                    // Reserve capacity first, but arm only after setCurrent: cache callbacks must not wait for the
+                    // write this very call is registering. The family lock keeps dirty + arm atomic to CPU page-off.
+                    if (p.status == NV_SURFACE_SYNC_READY) {
+                        const bool dirty = nvAccelSurfDirty(cache, res, p.plane) == 0;
+                        IOLockLock(l);
+                        if (dirty) {
+                            if (nvSurfaceArm(&gSurfTimeline, self, p.surfaceID, p.ticket) != NV_SURFACE_SYNC_READY)
+                                p.status = NV_SURFACE_SYNC_FAILED; // connection closed during setCurrent
+                        } else {
+                            (void)nvSurfaceEnd(&gSurfTimeline, self, p.surfaceID, p.ticket, false, &released);
+                            IOLockWakeup(l, &gSurfTimeline, false);
+                            p.ticket = 0; p.status = NV_SURFACE_SYNC_BUSY;
+                        }
+                        IOLockUnlock(l);
+                    }
+                    if (cache) ((OSObject *)cache)->release();
+                    nvFamUnlock(a);
+                }
+            } else {
+                IOLockLock(l);
+                if (self->fClosed) p.status = NV_SURFACE_SYNC_INVALID;
+                else if (p.op == NV_SURFACE_SYNC_SNAPSHOT)
+                    p.status = nvSurfaceSnapshot(&gSurfTimeline, p.surfaceID, &p.ticket);
+                else p.status = nvSurfacePoll(&gSurfTimeline, p.surfaceID, p.ticket);
+                IOLockUnlock(l);
+            }
+            ((OSObject *)surf)->release();
+        }
+        if (released) ((OSObject *)released)->release();
+        *(NVSurfaceSyncRequest *)args->structureOutput = p;
+        args->structureOutputSize = sizeof p;
+        return kIOReturnSuccess;
+    }
+    IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+                           IOExternalMethodDispatch *, OSObject *, void *) override {
+        if (selector) return kIOReturnBadArgument;
+        IOExternalMethodDispatch d = {call, 0, sizeof(NVSurfaceSyncRequest), 0, sizeof(NVSurfaceSyncRequest)};
+        return IOUserClient::externalMethod(selector, args, &d, this, nullptr);
+    }
+};
+OSDefineMetaClassAndStructors(NVSurfaceSyncClient, IOUserClient)
+static IOReturn nvSurfSyncNewClient(IOService *provider, task_t task, void *security, IOUserClient **out)
+{
+    if (!out) return kIOReturnBadArgument;
+    *out = nullptr;
+    auto *client = OSTypeAlloc(NVSurfaceSyncClient);
+    if (!client) return kIOReturnNoMemory;
+    if (!client->initWithTask(task, security, NV_SURFACE_SYNC_CLIENT, nullptr)) {
+        client->release(); return kIOReturnNoMemory;
+    }
+    if (!client->attach(provider)) { client->release(); return kIOReturnNotAttached; }
+    if (!client->start(provider)) { client->detach(provider); client->release(); return kIOReturnNotReady; }
+    *out = client;
+    return kIOReturnSuccess;
+}
+
 #include <mach/mach_time.h>
 static IOLock *volatile gNVSVStageLock;
 static IOBufferMemoryDescriptor *gNVSVStageBuf;
@@ -1611,7 +1783,7 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
     }
     // a CPU lock that arrives while WindowServer's GPU is still writing this surface waits for that write first, as a
     // normal IOSurfaceLock does on Apple's drivers (the commit marked it pending; see nvmtl_ws_mark_pending)
-    nvSurfWaitReady(_ZNK9IOSurface12getSurfaceIDEv(surf));
+    if (!nvSurfWaitReady(_ZNK9IOSurface12getSurfaceIDEv(surf))) { if (out) *out = false; return; }
     IOMemoryDescriptor *md = (IOMemoryDescriptor *)_ZNK9IOSurface19getMemoryDescriptorEv(surf);
     if (!md || md->prepare(kIODirectionNone) != kIOReturnSuccess) {
         gNVSVPageoffFail++;
@@ -1782,8 +1954,8 @@ static void nvAccelIopAsyncRun(void *p0, void *)
     const unsigned head = (unsigned)(e - gIopAs);
     IOSurface *s = e->s; e->s = nullptr;
   again:
-    nvSurfWaitReady(s->getSurfaceID());   // WindowServer did not wait for this composite; the flip does, off its thread
-    const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
+    const bool ready = nvSurfWaitReady(s->getSurfaceID()); // wait off WindowServer's submission thread
+    const OSSymbol *sym = ready ? OSSymbol::withCStringNoCopy("nvFlipToSurfacePure") : nullptr;
     IOReturn rr = sym ? e->fb->callPlatformFunction(sym, false, &e->f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
     if (sym) sym->release();
     const int outcome = nvAccelFlipOutcome(rr);
@@ -1908,7 +2080,7 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
     struct NVRMFlipRequest f; nvSVZero(&f, sizeof f);
     f.version = NVRM_FLIP_ABI_VERSION; f.kapiMemory = kmem; f.allocationCookie = vm->fAllocationCookie; f.width = (unsigned)W; f.height = (unsigned)H; f.pitch = (unsigned)P;
     if (gIopAsync && pipe) return nvAccelIopAsyncStart(pipe, fb, head, s, &f);
-    nvSurfWaitReady(s->getSurfaceID());
+    if (!nvSurfWaitReady(s->getSurfaceID())) return true; // keep the front buffer; do not copy unfinished pixels
     const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
     IOReturn rr = sym ? fb->callPlatformFunction(sym, false, &f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
     if (sym) sym->release();

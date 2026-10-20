@@ -24,6 +24,7 @@
     BOOL copyInputsPrepared, hasHostCopies;
 }
 @end
+#include "NVMTLSurfaceSync.m"
 static _Atomic unsigned gsub_inflight;
 static _Atomic unsigned long long gsub_ahead, gsub_peak;
 static NSMutableArray *nvmtl_quarantined_parts;
@@ -425,7 +426,6 @@ static int nvmtl_skip_empty_on(void) {
     }
 }
 - (void)nvmtlFinishExecution:(NSError *)error {
-    if (_scheduleAfterPublish) { _scheduleAfterPublish = NO; [self nvmtlMarkScheduled]; }
     for (NSUInteger i = _nextPart; i < _parts.count; i++) {
         NVMTLSubmissionPart *p = _parts[i];
         if (![p isKindOfClass:[NVMTLSubmissionPart class]] || !p->inflight) continue;
@@ -437,6 +437,12 @@ static int nvmtl_skip_empty_on(void) {
             [nvmtl_quarantined_parts addObject:p];
         }
     }
+    if (!nvmtl_surface_sync_finish(self, error != nil) && !error)
+        error = [NSError errorWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal
+            userInfo:@{NSLocalizedDescriptionKey:@"Could not retire IOSurface writes"}];
+    if (!error && nvmtl_surface_sync_finish_later(self)) return;
+    _surfaceSyncLatePublications = nil;
+    if (_scheduleAfterPublish) { _scheduleAfterPublish = NO; [self nvmtlMarkScheduled]; }
     if (!error) {
         for (dispatch_block_t action in _presentations) action();
     }
@@ -547,6 +553,7 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
 - (BOOL)nvmtlSubmitAhead {
     // a commit still putting its kernel marks in (nvmtlSubmitWithEvents) must not reach the GPU before them
     if (_executionDone || _cbError || !_committed || _commitMarking) return NO;
+    if (!nvmtl_surface_sync_dependencies(self)) return NO;
     if (_nextSubmit < _nextPart) _nextSubmit = _nextPart;
     while (_nextSubmit < _parts.count) {
         if (atomic_load(&gsub_inflight) >= nvmtl_gsub_cap()) return NO;
@@ -619,6 +626,8 @@ static void nvmtl_gsub_ahead_pass1(void) {
 }
 - (BOOL)nvmtlAdvancePart {
     if (_executionDone) return NO;
+    if (_surfaceSyncAsyncFinish) return NO;
+    if (!_cbError && !nvmtl_surface_sync_dependencies(self) && !_cbError) return NO;
     if (_cbError) { [self nvmtlFinishExecution:_cbError]; return YES; }
     if (_nextPart >= _parts.count) { [self nvmtlFinishExecution:nil]; return YES; }
     NVMTLSubmissionPart *part = _parts[_nextPart];
@@ -661,7 +670,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
             // the GPU has finished this part: its surfaces' kernel marks are released (nvmtl_ws_part_landed) before the
             // surface work below, which takes the surface's own lock
             NSMutableArray *settled = [NSMutableArray new];
-            for (NVMTLTexture *texture in nvmtl_ws_part_landed(self, _nextPart, settled)) if (![texture nvmtlSurfaceOut]) published = NO;
+            if (!nvmtl_surface_sync_part_landed(self, _nextPart, nvmtl_ws_part_landed(self, _nextPart, settled))) published = NO;
             if (!nvmtl_ws_publish_settled(settled, self)) published = NO;
             for (NVMTLBuffer *buffer in nvmtl_submission_copies(part->resources, YES)) nvmtl_buffer_sync_out(buffer);
         }
@@ -706,6 +715,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
     // nvmtl_ws_mark_pending). This command buffer is committed and holds its queue reservation, but nothing submits it
     // (_commitMarking stops the submit-ahead pass) or completes it (it is not pending yet) before its marks are in.
     nvmtl_ws_mark_pending(self);
+    nvmtl_surface_sync_begin(self);
     @synchronized ([NVMTLCommandBuffer class]) {
         _commitMarking = NO;
         nvmtl_surface_register_writes(self);
@@ -729,10 +739,10 @@ static void nvmtl_pump_buffers_sync(void) {
                     [reservations removeObjectAtIndex:0];
                 if (reservations.firstObject != cb->_reservation) continue;
                 if ([cb nvmtlAdvancePart]) progress = YES;
-                if (cb->_executionDone) {
+                if (cb->_executionDone || cb->_surfaceSyncAsyncFinish) {
                     [cb nvmtlReleaseReservation];
                     [nvmtl_pending_buffers removeObjectIdenticalTo:cb];
-                    [cb nvmtlFinishCallbacks];
+                    if (!cb->_surfaceSyncAsyncFinish) [cb nvmtlFinishCallbacks];
                 }
             }
         } while (progress);
@@ -781,10 +791,10 @@ static void nvmtl_pump_buffers(void) {
                     if (!eligible) continue;
                     if ([cb nvmtlAdvancePart]) progress = YES;
                     @synchronized ([NVMTLCommandBuffer class]) {
-                        if (cb->_executionDone) {
+                        if (cb->_executionDone || cb->_surfaceSyncAsyncFinish) {
                             [cb nvmtlReleaseReservation];
                             [nvmtl_pending_buffers removeObjectIdenticalTo:cb];
-                            [cb nvmtlFinishCallbacks];
+                            if (!cb->_surfaceSyncAsyncFinish) [cb nvmtlFinishCallbacks];
                         }
                     }
                 }
